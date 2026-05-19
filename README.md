@@ -56,13 +56,14 @@ build.bat
 1. Run **BootMark.exe** as Administrator (use **Restart as Administrator** if prompted).
 2. **Check Admin / Device Info** — verifies elevation and reads system identifiers.
 3. **Create Session** — creates a timestamped session folder and saves device info.
-4. **Backup BIOS Region** then **Backup Full SPI** — original backups are never overwritten.
+4. **Backup BIOS Region** then **Backup Full SPI** — creates `backups\bios_region_original.bin` (read-only) plus `backups\bios_region_edit_me.bin` (open this in H2OEZE).
 5. **Hash Backups** — writes SHA256 hashes to `hashes\hashes.txt`.
 6. **Test Rewrite Original BIOS Region** — confirms FPT can rewrite the saved backup.
-7. Edit your BIOS region externally, then save as `modified\logo_modified.bin` (or use **Select Modified BIOS File**).
+7. Edit `backups\bios_region_edit_me.bin` in H2OEZE, then save your flash image as `modified\logo_modified.bin` (or use **Select Modified BIOS File**).
 8. **Validate Modified File** — size and hash checks vs. the original BIOS-region backup.
 9. **Flash Modified BIOS Region** — enabled only after backup, rewrite test, and validation all pass.
-10. **Restart Now** after a successful flash, or **Restore Original BIOS Region** if needed.
+10. **Restart Now** after a successful flash.
+- **Emergency: Restore Original** (right column) — rollback only if flash failed or the PC will not boot; not needed when flash worked.
 
 All operations log to the GUI and `sessions\...\logs\bootmark_session.log`.
 

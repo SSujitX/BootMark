@@ -14,9 +14,11 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
-from PyQt6.QtCore import QProcess, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
+LogLineKind = Literal["normal", "progress", "command"]
+
+from PyQt6.QtCore import QEventLoop, QProcess, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QFont, QIcon, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -34,7 +36,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-BOOTMARK_VERSION = "1.0.0"
+BOOTMARK_VERSION = "1.0.1"
 APP_USER_MODEL_ID = "com.bootmark.app"
 ICON_FILE_NAME = "logo.ico"
 DEFAULT_WINDOW_WIDTH = 780
@@ -45,6 +47,7 @@ FPT_SUCCESS_MARKER = "FPT Operation Successful"
 REWRITE_IDENTICAL_MARKER = "RESULT: The data is identical."
 
 BIOS_BACKUP_NAME = "bios_region_original.bin"
+BIOS_EDIT_COPY_NAME = "bios_region_edit_me.bin"
 FULL_SPI_BACKUP_NAME = "full_spi_original.bin"
 MODIFIED_DEFAULT_NAME = "logo_modified.bin"
 
@@ -185,6 +188,37 @@ QPushButton:disabled {
     border-color: #333333;
 }
 """
+
+
+def extract_percent(line: str) -> int | None:
+    match = re.search(r"(\d+)\s*%", line)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def is_progress_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return False
+    if extract_percent(stripped) is not None:
+        return True
+    if re.search(
+        r"(?i)(reading|writing|programming|verifying|erasing|read|write|flash)",
+        stripped,
+    ) and re.search(r"\d", stripped):
+        return True
+    return False
+
+
+def split_process_output(chunk: str) -> list[str]:
+    normalized = chunk.replace("\r\n", "\n")
+    lines: list[str] = []
+    for piece in re.split(r"[\r\n]+", normalized):
+        text = piece.strip()
+        if text:
+            lines.append(text)
+    return lines
 
 
 def classify_log_line(message: str) -> str:
@@ -506,19 +540,26 @@ class DeleteFoldersThread(QThread):
 class SerialCommandRunner:
     """Runs external commands one at a time via QProcess."""
 
-    def __init__(self, log_callback: Callable[[str], None]) -> None:
-        self._log = log_callback
+    _FLUSH_MS = 120
+
+    def __init__(self, line_callback: Callable[[str, LogLineKind], None]) -> None:
+        self._line_callback = line_callback
         self._queue: list[QueuedCommand] = []
         self._process = QProcess()
         self._process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
         self._process.readyReadStandardOutput.connect(self._on_stdout)
         self._process.finished.connect(self._on_finished)
+        self._flush_timer = QTimer()
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.timeout.connect(self._flush_stdout_buffer)
         self._busy = False
         self._current: QueuedCommand | None = None
         self._output_buffer = ""
+        self._stdout_pending = ""
         self._on_complete: Callable[[bool, str, str], None] | None = None
         self._on_idle: Callable[[], None] | None = None
         self._on_section_end: Callable[[], None] | None = None
+        self._on_command_start: Callable[[], None] | None = None
 
     @property
     def busy(self) -> bool:
@@ -535,6 +576,9 @@ class SerialCommandRunner:
     def set_section_handler(self, handler: Callable[[], None] | None) -> None:
         self._on_section_end = handler
 
+    def set_command_start_handler(self, handler: Callable[[], None] | None) -> None:
+        self._on_command_start = handler
+
     def enqueue(self, command: QueuedCommand) -> None:
         self._queue.append(command)
         if not self._busy:
@@ -546,14 +590,40 @@ class SerialCommandRunner:
     def _timestamp(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+    def _schedule_stdout_flush(self) -> None:
+        if not self._flush_timer.isActive():
+            self._flush_timer.start(self._FLUSH_MS)
+
+    def _emit_process_line(self, line: str) -> None:
+        kind: LogLineKind = "progress" if is_progress_line(line) else "normal"
+        self._line_callback(line, kind)
+
+    def _flush_stdout_buffer(self) -> None:
+        if not self._stdout_pending:
+            return
+        data = self._stdout_pending
+        self._stdout_pending = ""
+        self._output_buffer += data
+        lines = split_process_output(data)
+        pending_progress: str | None = None
+        for line in lines:
+            if is_progress_line(line):
+                pending_progress = line
+                continue
+            if pending_progress is not None:
+                self._emit_process_line(pending_progress)
+                pending_progress = None
+            self._emit_process_line(line)
+        if pending_progress is not None:
+            self._emit_process_line(pending_progress)
+
     def _on_stdout(self) -> None:
-        data = bytes(self._process.readAllStandardOutput()).decode(
+        chunk = bytes(self._process.readAllStandardOutput()).decode(
             "utf-8", errors="replace"
         )
-        if data:
-            self._output_buffer += data
-            for line in data.splitlines():
-                self._log(f"[{self._timestamp()}] {line}")
+        if chunk:
+            self._stdout_pending += chunk
+            self._schedule_stdout_flush()
 
     def _start_next(self) -> None:
         if not self._queue:
@@ -564,24 +634,31 @@ class SerialCommandRunner:
         self._current = self._queue.pop(0)
         assert self._current is not None
         self._output_buffer = ""
+        self._stdout_pending = ""
+        if self._on_command_start is not None:
+            self._on_command_start()
         cmd = self._current
         display = f"{cmd.program} {' '.join(cmd.arguments)}"
-        self._log(f"[{self._timestamp()}] COMMAND: {display}")
-        self._log(f"[{self._timestamp()}] WORKING DIRECTORY: {cmd.working_directory}")
+        ts = self._timestamp()
+        self._line_callback(f"[{ts}] COMMAND: {display}", "command")
+        self._line_callback(
+            f"[{ts}] WORKING DIRECTORY: {cmd.working_directory}",
+            "command",
+        )
         self._process.setWorkingDirectory(cmd.working_directory)
         self._process.start(cmd.program, cmd.arguments)
 
     def _on_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
+        self._flush_timer.stop()
         trailing = bytes(self._process.readAllStandardOutput()).decode(
             "utf-8", errors="replace"
         )
         if trailing:
-            self._output_buffer += trailing
-            for line in trailing.splitlines():
-                self._log(f"[{self._timestamp()}] {line}")
+            self._stdout_pending += trailing
+        self._flush_stdout_buffer()
 
         ts = self._timestamp()
-        self._log(f"[{ts}] EXIT CODE: {exit_code}")
+        self._line_callback(f"[{ts}] EXIT CODE: {exit_code}", "command")
         success = False
         operation = ""
         combined = self._output_buffer
@@ -592,8 +669,10 @@ class SerialCommandRunner:
                 marker in combined for marker in markers
             )
             if not success and exit_code == 0:
-                self._log(
-                    f"[{ts}] Operation finished but required output markers were not found."
+                self._line_callback(
+                    f"[{ts}] Operation finished but required output markers "
+                    "were not found.",
+                    "normal",
                 )
         if self._on_complete:
             self._on_complete(success, operation, combined)
@@ -620,15 +699,21 @@ class BootMarkWindow(QMainWindow):
         self._rewrite_test_passed = False
         self._validation_passed = False
         self._flash_succeeded = False
+        self._flash_attempted = False
         self._pending_log_lines: list[str] = []
         self._cim_pending: list[tuple[str, str]] = []
         self._deleting_sessions = False
         self._delete_thread: DeleteFoldersThread | None = None
+        self._progress_anchor: int | None = None
+        self._progress_end: int | None = None
+        self._last_progress_percent: int | None = None
+        self._last_status_percent: int | None = None
 
-        self._runner = SerialCommandRunner(self._append_log)
+        self._runner = SerialCommandRunner(self._on_runner_line)
         self._runner.set_completion_handler(self._on_command_finished)
         self._runner.set_idle_handler(self._update_button_states)
         self._runner.set_section_handler(self._append_log_section)
+        self._runner.set_command_start_handler(self._finalize_progress_line)
 
         self._build_ui()
         self._apply_initial_geometry()
@@ -742,7 +827,8 @@ class BootMarkWindow(QMainWindow):
                 "btn_backup_bios",
                 "3. Backup BIOS Region",
                 "workflow",
-                "FPT read of the BIOS region into backups\\bios_region_original.bin.",
+                "FPT read into backups\\bios_region_original.bin and creates "
+                "backups\\bios_region_edit_me.bin for H2OEZE.",
             ),
             (
                 "btn_backup_spi",
@@ -780,19 +866,13 @@ class BootMarkWindow(QMainWindow):
                 "danger",
                 "Write modified\\logo_modified.bin to the BIOS region. Irreversible without backup.",
             ),
-            (
-                "btn_restore",
-                "10. Restore Original BIOS Region",
-                "danger",
-                "Flash backups\\bios_region_original.bin back to the BIOS region.",
-            ),
         ]
         utility_specs = [
             (
                 "btn_open_modified",
                 "Open Modified Folder",
                 "utility",
-                "Open sessions\\…\\modified\\ in Explorer to place logo_modified.bin.",
+                "Open sessions\\…\\modified\\ in Explorer for logo_modified.bin after editing.",
             ),
             (
                 "btn_open_session",
@@ -804,7 +884,14 @@ class BootMarkWindow(QMainWindow):
                 "btn_restart",
                 "Restart Now",
                 "restart",
-                "Reboot immediately (enabled after a successful flash).",
+                "Reboot after a successful flash to see the new logo.",
+            ),
+            (
+                "btn_restore",
+                "Emergency: Restore Original",
+                "danger",
+                "Rollback only — flashes bios_region_original.bin if step 9 failed or PC "
+                "will not boot. Skip if flash worked and the system is fine.",
             ),
             (
                 "btn_clear_session",
@@ -887,19 +974,7 @@ class BootMarkWindow(QMainWindow):
             self.btn_admin_device.setText("Restart as Administrator")
 
     # ---------------------------------------------------------------- logging
-    def _append_log(self, message: str, *, level: str | None = None) -> None:
-        if not message:
-            return
-        log_level = level or classify_log_line(message)
-        color = LOG_COLORS.get(log_level, LOG_COLORS["normal"])
-        safe = html.escape(message)
-        cursor = self._log_view.textCursor()
-        cursor.movePosition(QTextCursor.MoveOperation.End)
-        cursor.insertHtml(f'<span style="color:{color}">{safe}</span><br>')
-        self._log_view.setTextCursor(cursor)
-        self._log_view.verticalScrollBar().setValue(
-            self._log_view.verticalScrollBar().maximum()
-        )
+    def _write_log_file(self, message: str) -> None:
         if self._session_log_path:
             try:
                 with self._session_log_path.open("a", encoding="utf-8") as handle:
@@ -909,7 +984,85 @@ class BootMarkWindow(QMainWindow):
         else:
             self._pending_log_lines.append(message)
 
+    def _scroll_log_to_end(self) -> None:
+        self._log_view.verticalScrollBar().setValue(
+            self._log_view.verticalScrollBar().maximum()
+        )
+
+    def _finalize_progress_line(self) -> None:
+        if self._progress_anchor is not None:
+            cursor = self._log_view.textCursor()
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            cursor.insertHtml("<br>")
+            self._log_view.setTextCursor(cursor)
+        self._progress_anchor = None
+        self._progress_end = None
+        self._last_progress_percent = None
+        self._last_status_percent = None
+
+    def _update_progress_line(self, message: str, raw_line: str) -> None:
+        color = LOG_COLORS["meta"]
+        safe = html.escape(message)
+        cursor = self._log_view.textCursor()
+        if self._progress_anchor is None:
+            cursor.movePosition(QTextCursor.MoveOperation.End)
+            self._progress_anchor = cursor.position()
+            cursor.insertHtml(f'<span style="color:{color}">{safe}</span>')
+            self._progress_end = cursor.position()
+        else:
+            cursor.setPosition(self._progress_anchor)
+            cursor.setPosition(
+                self._progress_end,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            cursor.removeSelectedText()
+            cursor.insertHtml(f'<span style="color:{color}">{safe}</span>')
+            self._progress_end = cursor.position()
+        self._log_view.setTextCursor(cursor)
+        self._scroll_log_to_end()
+
+        percent = extract_percent(raw_line)
+        if percent is not None and percent != self._last_progress_percent:
+            self._write_log_file(message)
+            self._last_progress_percent = percent
+        if percent is not None and percent != self._last_status_percent:
+            self._last_status_percent = percent
+            self._set_status(f"FPT progress: {percent}%")
+            QApplication.processEvents(
+                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+            )
+
+    def _on_runner_line(self, line: str, kind: LogLineKind) -> None:
+        if not line:
+            return
+        if kind == "command":
+            self._finalize_progress_line()
+            self._append_log(line, level=classify_log_line(line))
+            return
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        display = line if line.startswith("[") else f"[{ts}] {line}"
+        if kind == "progress" or is_progress_line(line):
+            self._update_progress_line(display, line)
+            return
+        self._finalize_progress_line()
+        self._append_log(display, level=classify_log_line(line))
+
+    def _append_log(self, message: str, *, level: str | None = None) -> None:
+        if not message:
+            return
+        self._finalize_progress_line()
+        log_level = level or classify_log_line(message)
+        color = LOG_COLORS.get(log_level, LOG_COLORS["normal"])
+        safe = html.escape(message)
+        cursor = self._log_view.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertHtml(f'<span style="color:{color}">{safe}</span><br>')
+        self._log_view.setTextCursor(cursor)
+        self._scroll_log_to_end()
+        self._write_log_file(message)
+
     def _append_log_section(self) -> None:
+        self._finalize_progress_line()
         cursor = self._log_view.textCursor()
         cursor.movePosition(QTextCursor.MoveOperation.End)
         cursor.insertHtml(
@@ -954,6 +1107,23 @@ class BootMarkWindow(QMainWindow):
         if not self._session_path:
             return None
         return self._session_path / "backups" / BIOS_BACKUP_NAME
+
+    def _bios_edit_copy_path(self) -> Path | None:
+        if not self._session_path:
+            return None
+        return self._session_path / "backups" / BIOS_EDIT_COPY_NAME
+
+    def _create_bios_edit_copy(self) -> Path | None:
+        """Working copy in backups\\ for H2OEZE — original stays read-only."""
+        original = self._bios_backup_path()
+        if not original or not original.is_file():
+            return None
+        edit_copy = self._bios_edit_copy_path()
+        assert edit_copy is not None
+        if edit_copy.exists():
+            return edit_copy
+        shutil.copy2(original, edit_copy)
+        return edit_copy
 
     def _full_spi_backup_path(self) -> Path | None:
         if not self._session_path:
@@ -1095,8 +1265,18 @@ class BootMarkWindow(QMainWindow):
             and fpt_ok
             and session_ok
             and bios_backup
+            and self._flash_attempted
             and not busy
         )
+        if self._flash_succeeded:
+            self.btn_restore.setToolTip(
+                "Optional rollback — only if the PC will not boot or the image was wrong. "
+                "Not needed when flash succeeded and the laptop works."
+            )
+        elif self._flash_attempted:
+            self.btn_restore.setToolTip(
+                "Flash was attempted. Use this only if boot fails or you need the old BIOS back."
+            )
         self.btn_restart.setEnabled(self._flash_succeeded and not busy)
         self.btn_open_session.setEnabled(session_ok and not self._deleting_sessions)
         self.btn_clear_session.setEnabled(session_ok and not busy)
@@ -1111,6 +1291,7 @@ class BootMarkWindow(QMainWindow):
         self._rewrite_test_passed = False
         self._validation_passed = False
         self._flash_succeeded = False
+        self._flash_attempted = False
         self._set_status("No active session. Run Create Session to start again.")
 
     def _start_background_delete(self, folders: list[Path], mode: str) -> None:
@@ -1326,6 +1507,7 @@ class BootMarkWindow(QMainWindow):
         self._rewrite_test_passed = False
         self._validation_passed = False
         self._flash_succeeded = False
+        self._flash_attempted = False
         self._modified_file = None
 
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1427,6 +1609,7 @@ class BootMarkWindow(QMainWindow):
         lines: list[str] = []
         targets = [
             self._bios_backup_path(),
+            self._bios_edit_copy_path(),
             self._full_spi_backup_path(),
             self._modified_default_path(),
         ]
@@ -1568,6 +1751,8 @@ class BootMarkWindow(QMainWindow):
         if reply != QMessageBox.StandardButton.Yes:
             return
         self._flash_succeeded = False
+        self._flash_attempted = True
+        self._update_button_states()
         self._run_fpt(
             "flash_modified",
             ["-bios", "-f", str(modified)],
@@ -1580,8 +1765,10 @@ class BootMarkWindow(QMainWindow):
             self._warn("Backup missing", "No BIOS-region backup to restore.")
             return
         reply = self._question(
-            "Confirm restore",
-            "Restore the original BIOS region from backup?",
+            "Emergency restore",
+            "Put the ORIGINAL BIOS region back from backup?\n\n"
+            "Use this only if flash failed, the PC will not boot, or the image was wrong.\n"
+            "If step 9 worked and the laptop is fine, choose No and use Restart instead.",
             warning=True,
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -1690,9 +1877,43 @@ class BootMarkWindow(QMainWindow):
             self._warn("FPT platform mismatch", mismatch)
 
         if operation == "backup_bios" and success:
-            self._append_log(f"[{ts}] BIOS-region backup successful.")
+            self._append_log(f"[{ts}] BIOS-region backup successful.", level="success")
+            self._append_log(
+                f"[{ts}] Original (do not edit): backups\\{BIOS_BACKUP_NAME}",
+                level="success",
+            )
+            edit_copy = self._create_bios_edit_copy()
+            if edit_copy:
+                self._append_log(
+                    f"[{ts}] --- Edit this file in H2OEZE ---",
+                    level="success",
+                )
+                self._append_log(
+                    f"[{ts}] backups\\{BIOS_EDIT_COPY_NAME}",
+                    level="success",
+                )
+                self._append_log(
+                    f"[{ts}] Open this in H2OEZE — working copy "
+                    "(auto-created from the original).",
+                    level="success",
+                )
+                self._append_log(
+                    f"[{ts}] After editing, save your flash image as: "
+                    f"modified\\{MODIFIED_DEFAULT_NAME}",
+                    level="success",
+                )
+            else:
+                self._append_log(
+                    f"[{ts}] Could not create backups\\{BIOS_EDIT_COPY_NAME}.",
+                    level="warning",
+                )
         elif operation == "backup_spi" and success:
-            self._append_log(f"[{ts}] Full SPI backup successful.")
+            self._append_log(f"[{ts}] Full SPI backup successful.", level="success")
+            self._append_log(
+                f"[{ts}] Saved: backups\\{FULL_SPI_BACKUP_NAME} — safety archive only; "
+                f"for logo edits use the BIOS-region backup file above.",
+                level="success",
+            )
         elif operation == "rewrite_test":
             self._rewrite_test_passed = success
             if success:
@@ -1704,12 +1925,25 @@ class BootMarkWindow(QMainWindow):
             if success:
                 self._flash_succeeded = True
                 self._append_log(f"[{ts}] Flash successful.")
+                self._append_log(
+                    f"[{ts}] If the PC boots normally, use Restart — "
+                    "Emergency Restore is not required.",
+                    level="success",
+                )
                 self._info(
                     "Flash successful",
-                    "Flash successful. Restart to view the new boot logo.",
+                    "Flash successful. Restart to view the new boot logo.\n\n"
+                    "You do not need Emergency Restore if the laptop boots normally.",
                 )
+                self._update_button_states()
             else:
                 self._append_log(f"[{ts}] Flash failed.")
+                self._append_log(
+                    f"[{ts}] If the PC will not boot, use Emergency: Restore Original "
+                    "on the right.",
+                    level="warning",
+                )
+                self._update_button_states()
         elif operation == "restore_original":
             if success:
                 self._append_log(f"[{ts}] Restore successful.")
