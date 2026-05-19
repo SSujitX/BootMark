@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,7 +20,7 @@ from typing import Callable, Literal
 
 LogLineKind = Literal["normal", "progress", "command"]
 
-from PyQt6.QtCore import QEventLoop, QProcess, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QProcess, QThread, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QFont, QIcon, QTextCursor
 from PyQt6.QtWidgets import (
     QApplication,
@@ -37,7 +38,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-BOOTMARK_VERSION = "1.0.2"
+BOOTMARK_VERSION = "1.0.3"
 APP_USER_MODEL_ID = "com.bootmark.app"
 ICON_FILE_NAME = "logo.ico"
 DEFAULT_WINDOW_WIDTH = 780
@@ -198,10 +199,35 @@ def extract_percent(line: str) -> int | None:
     return None
 
 
+def extract_block_progress(line: str) -> tuple[int, int] | None:
+    """FPT prints e.g. 'Processed memory blocks 192 from 3071'."""
+    match = re.search(r"(\d+)\s+from\s+(\d+)", line, re.IGNORECASE)
+    if not match:
+        return None
+    current = int(match.group(1))
+    total = int(match.group(2))
+    if total <= 0 or current > total:
+        return None
+    return current, total
+
+
+def extract_progress_percent(line: str) -> int | None:
+    percent = extract_percent(line)
+    if percent is not None:
+        return percent
+    blocks = extract_block_progress(line)
+    if blocks:
+        current, total = blocks
+        return current * 100 // total
+    return None
+
+
 def is_progress_line(line: str) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
+    if extract_block_progress(stripped):
+        return True
     if extract_percent(stripped) is not None:
         return True
     if re.search(
@@ -210,6 +236,18 @@ def is_progress_line(line: str) -> bool:
     ) and re.search(r"\d", stripped):
         return True
     return False
+
+
+def format_fpt_progress_display(raw_line: str, timestamp: str) -> str:
+    blocks = extract_block_progress(raw_line)
+    percent = extract_progress_percent(raw_line)
+    if blocks:
+        current, total = blocks
+        pct = percent if percent is not None else 0
+        return f"[{timestamp}] FPT progress: block {current}/{total} ({pct}%)"
+    if percent is not None:
+        return f"[{timestamp}] FPT progress: {percent}%"
+    return f"[{timestamp}] {raw_line}"
 
 
 def split_process_output(chunk: str) -> list[str]:
@@ -571,7 +609,7 @@ class DeleteFoldersThread(QThread):
 class SerialCommandRunner:
     """Runs external commands one at a time via QProcess."""
 
-    _FLUSH_MS = 120
+    _FLUSH_MS = 250
 
     def __init__(self, line_callback: Callable[[str, LogLineKind], None]) -> None:
         self._line_callback = line_callback
@@ -748,6 +786,7 @@ class BootMarkWindow(QMainWindow):
         self._progress_end: int | None = None
         self._last_progress_percent: int | None = None
         self._last_status_percent: int | None = None
+        self._last_progress_ui_time = 0.0
 
         self._runner = SerialCommandRunner(self._on_runner_line)
         self._runner.set_completion_handler(self._on_command_finished)
@@ -1039,12 +1078,24 @@ class BootMarkWindow(QMainWindow):
         self._progress_end = None
         self._last_progress_percent = None
         self._last_status_percent = None
+        self._last_progress_ui_time = 0.0
 
     def _update_progress_line(self, message: str, raw_line: str) -> None:
+        percent = extract_progress_percent(raw_line)
+        now = time.monotonic()
+        first_line = self._progress_anchor is None
+        if (
+            not first_line
+            and percent is not None
+            and percent == self._last_progress_percent
+            and (now - self._last_progress_ui_time) < 0.2
+        ):
+            return
+
         color = LOG_COLORS["meta"]
         safe = html.escape(message)
         cursor = self._log_view.textCursor()
-        if self._progress_anchor is None:
+        if first_line:
             cursor.movePosition(QTextCursor.MoveOperation.End)
             self._progress_anchor = cursor.position()
             cursor.insertHtml(f'<span style="color:{color}">{safe}</span>')
@@ -1059,18 +1110,20 @@ class BootMarkWindow(QMainWindow):
             cursor.insertHtml(f'<span style="color:{color}">{safe}</span>')
             self._progress_end = cursor.position()
         self._log_view.setTextCursor(cursor)
-        self._scroll_log_to_end()
+        self._last_progress_ui_time = now
 
-        percent = extract_percent(raw_line)
         if percent is not None and percent != self._last_progress_percent:
             self._write_log_file(message)
             self._last_progress_percent = percent
+            self._scroll_log_to_end()
         if percent is not None and percent != self._last_status_percent:
             self._last_status_percent = percent
-            self._set_status(f"FPT progress: {percent}%")
-            QApplication.processEvents(
-                QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
-            )
+            blocks = extract_block_progress(raw_line)
+            if blocks:
+                current, total = blocks
+                self._set_status(f"FPT progress: block {current}/{total} ({percent}%)")
+            else:
+                self._set_status(f"FPT progress: {percent}%")
 
     def _on_runner_line(self, line: str, kind: LogLineKind) -> None:
         if not line:
@@ -1080,10 +1133,11 @@ class BootMarkWindow(QMainWindow):
             self._append_log(line, level=classify_log_line(line))
             return
         ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        display = line if line.startswith("[") else f"[{ts}] {line}"
         if kind == "progress" or is_progress_line(line):
+            display = format_fpt_progress_display(line, ts)
             self._update_progress_line(display, line)
             return
+        display = line if line.startswith("[") else f"[{ts}] {line}"
         self._finalize_progress_line()
         self._append_log(display, level=classify_log_line(line))
 

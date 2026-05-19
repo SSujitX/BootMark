@@ -1,6 +1,6 @@
 [project]
 name = "bootmark"
-version = "1.0.2"
+version = "1.0.3"
 description = "BIOS Backup / Validation / Flash Assistant for Windows"
 readme = "README.md"
 requires-python = ">=3.13.12"
