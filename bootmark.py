@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -36,7 +37,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-BOOTMARK_VERSION = "1.0.1"
+BOOTMARK_VERSION = "1.0.2"
 APP_USER_MODEL_ID = "com.bootmark.app"
 ICON_FILE_NAME = "logo.ico"
 DEFAULT_WINDOW_WIDTH = 780
@@ -363,6 +364,35 @@ def fpt_working_directory(fpt_path: Path) -> Path:
     return fpt_path.parent
 
 
+def build_fpt_argument_list(extra: list[str]) -> list[str]:
+    """FPT args with -y (no prompts). Resolve filesystem paths for Windows."""
+    resolved: list[str] = ["-y"]
+    for arg in extra:
+        if arg.startswith("-"):
+            resolved.append(arg)
+            continue
+        candidate = Path(arg)
+        if candidate.is_absolute() or (len(arg) > 1 and arg[1] == ":"):
+            resolved.append(str(candidate.resolve()))
+        else:
+            resolved.append(arg)
+    return resolved
+
+
+def build_windows_command_line(program: str, arguments: list[str]) -> str:
+    return subprocess.list2cmdline([program, *arguments])
+
+
+def fpt_invalid_args_hint(output: str) -> str | None:
+    if "Error 37" not in output and "Invalid command line option" not in output:
+        return None
+    return (
+        "FPT rejected the command line (Error 37). This often happens when the path "
+        "contains spaces (for example Desktop\\BootMark v1.0.1). Move BootMark to a "
+        "folder without spaces, such as C:\\BootMark, and try again."
+    )
+
+
 def sanitize_path_component(value: str) -> str:
     cleaned = re.sub(r'[<>:"/\\|?*]', "", value or "Unknown")
     cleaned = re.sub(r"\s+", "_", cleaned.strip())
@@ -511,6 +541,7 @@ class QueuedCommand:
     working_directory: str
     operation: str
     success_markers: list[str] = field(default_factory=lambda: [FPT_SUCCESS_MARKER])
+    command_line: str | None = None
 
 
 class DeleteFoldersThread(QThread):
@@ -556,6 +587,7 @@ class SerialCommandRunner:
         self._current: QueuedCommand | None = None
         self._output_buffer = ""
         self._stdout_pending = ""
+        self._suppress_fpt_help = False
         self._on_complete: Callable[[bool, str, str], None] | None = None
         self._on_idle: Callable[[], None] | None = None
         self._on_section_end: Callable[[], None] | None = None
@@ -595,6 +627,10 @@ class SerialCommandRunner:
             self._flush_timer.start(self._FLUSH_MS)
 
     def _emit_process_line(self, line: str) -> None:
+        if self._suppress_fpt_help and re.match(r"^-\w", line.strip()):
+            return
+        if "Invalid command line option" in line or "Error 37:" in line:
+            self._suppress_fpt_help = True
         kind: LogLineKind = "progress" if is_progress_line(line) else "normal"
         self._line_callback(line, kind)
 
@@ -635,10 +671,11 @@ class SerialCommandRunner:
         assert self._current is not None
         self._output_buffer = ""
         self._stdout_pending = ""
+        self._suppress_fpt_help = False
         if self._on_command_start is not None:
             self._on_command_start()
         cmd = self._current
-        display = f"{cmd.program} {' '.join(cmd.arguments)}"
+        display = cmd.command_line or f"{cmd.program} {' '.join(cmd.arguments)}"
         ts = self._timestamp()
         self._line_callback(f"[{ts}] COMMAND: {display}", "command")
         self._line_callback(
@@ -646,7 +683,10 @@ class SerialCommandRunner:
             "command",
         )
         self._process.setWorkingDirectory(cmd.working_directory)
-        self._process.start(cmd.program, cmd.arguments)
+        if cmd.command_line:
+            self._process.startCommand(cmd.command_line)
+        else:
+            self._process.start(cmd.program, cmd.arguments)
 
     def _on_finished(self, exit_code: int, _exit_status: QProcess.ExitStatus) -> None:
         self._flush_timer.stop()
@@ -1552,13 +1592,19 @@ class BootMarkWindow(QMainWindow):
             self._warn("No session", "Create a session first.")
             return False
         markers = success_markers if success_markers is not None else [FPT_SUCCESS_MARKER]
+        program = str(self._fpt_path.resolve())
+        args = build_fpt_argument_list(arguments)
+        command_line = (
+            build_windows_command_line(program, args) if sys.platform == "win32" else None
+        )
         self._runner.enqueue(
             QueuedCommand(
-                program=str(self._fpt_path),
-                arguments=arguments,
+                program=program,
+                arguments=args,
                 working_directory=str(fpt_working_directory(self._fpt_path)),
                 operation=operation,
                 success_markers=markers,
+                command_line=command_line,
             )
         )
         self._update_button_states()
@@ -1875,6 +1921,17 @@ class BootMarkWindow(QMainWindow):
             self._append_log(f"[{ts}] {mismatch}", level="error")
             self._set_status("FPT wrong platform — replace tools\\fpt\\WIN64 with matching CSME kit.")
             self._warn("FPT platform mismatch", mismatch)
+
+        invalid_args = fpt_invalid_args_hint(output)
+        if invalid_args and operation in {
+            "backup_bios",
+            "backup_spi",
+            "rewrite_test",
+            "flash_modified",
+            "restore_original",
+        }:
+            self._append_log(f"[{ts}] {invalid_args}", level="error")
+            self._warn("FPT command line error", invalid_args)
 
         if operation == "backup_bios" and success:
             self._append_log(f"[{ts}] BIOS-region backup successful.", level="success")
