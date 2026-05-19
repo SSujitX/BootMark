@@ -1,0 +1,10 @@
+[project]
+name = "bootmark"
+version = "0.1.0"
+description = "BIOS Boot Manager"
+readme = "README.md"
+requires-python = ">=3.13.12"
+dependencies = [
+    "pyinstaller>=6.20.0",
+    "pyqt6>=6.11.0",
+]
